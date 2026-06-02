@@ -243,6 +243,108 @@ feature_key: docFetch-test
 branch_date: 创建当天日期
 ```
 
+## 重命名分支
+
+`gc rename` 用来重命名本地 Git 分支，并同步更新 `gc` 本地记录。
+
+基本用法：
+
+```bash
+gc rename <new_branch>
+```
+
+示例：
+
+```bash
+gc rename ma-dhSelectOpt-5.22
+```
+
+这会执行：
+
+```bash
+git branch -m ma-dhSelectOpt-5.22
+```
+
+也就是把当前分支重命名为 `ma-dhSelectOpt-5.22`。
+
+### 顺便更新迭代名称
+
+```bash
+gc rename ma-dhSelectOpt-5.22 -n "数字人列表选择优化"
+```
+
+`-n` 在 `gc rename` 中是可选的。
+
+如果填写了 `-n`，会同步更新本地记录里的迭代名称。
+
+### 指定旧分支
+
+默认情况下，`gc rename` 会重命名当前分支。
+
+如果要重命名一个非当前分支，可以使用 `--from`：
+
+```bash
+gc rename ma-newBranch-5.22 --from ma-oldBranch-5.22
+```
+
+这会执行：
+
+```bash
+git branch -m ma-oldBranch-5.22 ma-newBranch-5.22
+```
+
+### 只预览
+
+```bash
+gc rename ma-dhSelectOpt-5.22 --dry-run
+```
+
+只打印将要执行的操作，不会真正重命名，也不会更新本地记录。
+
+### 对本地记录的影响
+
+`gc rename` 会重新解析新分支名，并更新本地记录中的这些字段：
+
+- 分支名
+- 迭代版本
+- 功能标识
+- 分支日期
+- 创建人标识
+- 迭代名称，如果传了 `-n`
+
+同步记录时，会用当前项目路径和旧分支名匹配记录。
+
+如果找不到对应记录，Git 分支仍会被重命名，但会提示：
+
+```text
+未找到可同步的台账记录
+```
+
+### 远端分支处理
+
+`gc rename` 只处理本地分支，不会自动 push，也不会自动删除远端旧分支。
+
+如果旧分支还没有 push 到远端，重命名后直接 push 新分支：
+
+```bash
+git push -u origin ma-dhSelectOpt-5.22
+```
+
+如果旧分支已经 push 到远端，通常需要：
+
+```bash
+git push -u origin ma-dhSelectOpt-5.22
+git push origin --delete old-branch-name
+```
+
+如果删除远端旧分支时报：
+
+```text
+remote ref does not exist
+```
+
+说明远端没有这个旧分支，一般可以忽略。
+
 ## GitLab MR
 
 打开 Web 页面：
