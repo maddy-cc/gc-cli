@@ -1,0 +1,8 @@
+.DS_Store
+dist/
+*.tmp
+*.log
+
+# Local user data must never be committed.
+.gc-branch-log.jsonl
+.gc-config.json

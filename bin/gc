@@ -1,0 +1,2287 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import html
+import http.server
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+import webbrowser
+
+
+DEFAULT_LEDGER = "~/.gc-branch-log.jsonl"
+DEFAULT_CONFIG = "~/.gc-config.json"
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8765
+STATUS_NOT_LIVE = "未上线"
+STATUS_LIVE = "已上线"
+VALID_STATUSES = {STATUS_NOT_LIVE, STATUS_LIVE}
+VERSION_RE = re.compile(r"^\d+(?:\.\d+)+$")
+DATE_RE = re.compile(r"^(?:\d{4}\.)?\d{1,2}\.\d{1,2}$")
+
+
+def run_git(args, cwd=None, check=True):
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as error:
+        if cwd and not Path(cwd).exists():
+            raise RuntimeError(f"本地项目路径不存在: {cwd}") from error
+        raise RuntimeError(str(error)) from error
+    if check and result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(message)
+    return result.stdout.strip()
+
+
+def default_branch_date():
+    now = datetime.now(timezone.utc).astimezone()
+    return f"{now.month}.{now.day:02d}"
+
+
+def is_version_part(value):
+    return bool(VERSION_RE.match(value or ""))
+
+
+def is_date_part(value):
+    return bool(DATE_RE.match(value or ""))
+
+
+def parse_branch_name(branch):
+    parts = [part for part in branch.split("-") if part]
+    if len(parts) < 2:
+        raise ValueError(
+            "分支名格式应类似 ma-1.6.8-docFetch-5.20 或 ma-virtualList-fix"
+        )
+
+    owner = parts[0]
+    rest = parts[1:]
+    iteration_version = ""
+    branch_date = default_branch_date()
+
+    if rest and is_version_part(rest[0]):
+        iteration_version = rest.pop(0)
+
+    if rest and is_date_part(rest[-1]):
+        branch_date = rest.pop()
+
+    feature_key = "-".join(rest)
+
+    if not owner or not feature_key:
+        raise ValueError("分支名至少需要包含姓名和功能，例如 ma-virtualList-fix")
+
+    return {
+        "owner": owner,
+        "iteration_version": iteration_version,
+        "feature_key": feature_key,
+        "branch_date": branch_date,
+    }
+
+
+def get_repo_context():
+    repo_root = Path(run_git(["rev-parse", "--show-toplevel"]))
+    project_name = repo_root.name
+    current_branch = run_git(["branch", "--show-current"], cwd=repo_root)
+    head_sha = run_git(["rev-parse", "HEAD"], cwd=repo_root)
+
+    if not current_branch:
+        current_branch = "HEAD"
+
+    return {
+        "repo_root": str(repo_root),
+        "project_name": project_name,
+        "base_branch": current_branch,
+        "base_sha": head_sha,
+    }
+
+
+def append_record(record, ledger_path):
+    path = Path(os.path.expanduser(ledger_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return path
+
+
+def resolve_config_path(path=DEFAULT_CONFIG):
+    return Path(os.path.expanduser(path))
+
+
+def read_config(path=DEFAULT_CONFIG):
+    path = resolve_config_path(path)
+    if not path.exists():
+        return {}, path
+
+    with path.open("r", encoding="utf-8") as handle:
+        try:
+            config = json.load(handle)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{path} 不是有效 JSON：{error}") from error
+
+    if not isinstance(config, dict):
+        raise ValueError(f"{path} 顶层必须是 JSON object")
+
+    return config, path
+
+
+def write_config(config, path=DEFAULT_CONFIG):
+    path = resolve_config_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+    os.chmod(path, 0o600)
+    return path
+
+
+def mask_token(token):
+    if not token:
+        return ""
+    if len(token) <= 8:
+        return "*" * len(token)
+    return f"{token[:6]}...{token[-4:]}"
+
+
+def public_gitlab_config(config):
+    gitlab = config.get("gitlab", {})
+    token = gitlab.get("token", "")
+    return {
+        "url": gitlab.get("url", ""),
+        "default_target_branch": gitlab.get("default_target_branch", "main"),
+        "has_token": bool(token),
+        "token_masked": mask_token(token),
+    }
+
+
+def normalize_gitlab_url(url):
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        raise ValueError("请填写 GitLab 地址")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("GitLab 地址应类似 https://gitlab.example.com")
+    return url
+
+
+def save_gitlab_config(payload, path=DEFAULT_CONFIG):
+    config, _ = read_config(path)
+    gitlab = dict(config.get("gitlab", {}))
+
+    gitlab["url"] = normalize_gitlab_url(payload.get("url", gitlab.get("url", "")))
+    target_branch = (payload.get("default_target_branch") or "main").strip()
+    gitlab["default_target_branch"] = target_branch or "main"
+
+    token = (payload.get("token") or "").strip()
+    if token:
+        gitlab["token"] = token
+    elif not gitlab.get("token"):
+        raise ValueError("首次保存需要填写 Access Token")
+
+    config["gitlab"] = gitlab
+    saved_path = write_config(config, path)
+    return public_gitlab_config(config), saved_path
+
+
+def resolve_gitlab_credentials(payload=None, path=DEFAULT_CONFIG):
+    payload = payload or {}
+    config, _ = read_config(path)
+    gitlab = dict(config.get("gitlab", {}))
+
+    url = normalize_gitlab_url(payload.get("url") or gitlab.get("url", ""))
+    token = (payload.get("token") or gitlab.get("token", "")).strip()
+    if not token:
+        raise ValueError("请填写 Access Token")
+
+    return url, token
+
+
+def gitlab_api_json(url, token, path):
+    return gitlab_api_request(url, token, path, method="GET")
+
+
+def gitlab_api_request(url, token, path, method="GET", payload=None):
+    body = None
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "Accept": "application/json",
+        "User-Agent": "gc-branch-ledger",
+    }
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = Request(
+        f"{url}{path}",
+        data=body,
+        headers=headers,
+        method=method,
+    )
+
+    try:
+        with urlopen(request, timeout=12) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body)
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GitLab 返回 {error.code}: {detail[:240]}") from error
+    except URLError as error:
+        raise RuntimeError(f"无法连接 GitLab: {error.reason}") from error
+
+
+def test_gitlab_connection(payload=None, path=DEFAULT_CONFIG):
+    url, token = resolve_gitlab_credentials(payload, path)
+    user = gitlab_api_json(url, token, "/api/v4/user")
+    return {
+        "ok": True,
+        "url": url,
+        "username": user.get("username") or user.get("name") or "",
+        "name": user.get("name") or "",
+    }
+
+
+def normalize_remote_project_path(path):
+    path = (path or "").strip().strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path
+
+
+def parse_gitlab_project_path(remote_url, gitlab_url):
+    remote_url = (remote_url or "").strip()
+    if not remote_url:
+        raise ValueError("当前项目没有 origin remote")
+
+    base = urlparse(gitlab_url)
+
+    if "://" in remote_url:
+        remote = urlparse(remote_url)
+        remote_path = normalize_remote_project_path(remote.path)
+        base_path = normalize_remote_project_path(base.path)
+        if base_path and remote_path.startswith(f"{base_path}/"):
+            remote_path = remote_path[len(base_path) + 1 :]
+        return remote_path
+
+    if ":" in remote_url and "@" in remote_url.split(":", 1)[0]:
+        _, project_path = remote_url.split(":", 1)
+        return normalize_remote_project_path(project_path)
+
+    raise ValueError(f"无法解析 origin remote: {remote_url}")
+
+
+def get_record_by_id(ledger_path, target_id):
+    records, path = read_records(ledger_path)
+    for index, record in enumerate(records):
+        if record_id(record, index) == target_id:
+            return records, path, index, record
+    return records, path, None, None
+
+
+def write_records(records, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(tmp_path, path)
+
+
+def get_origin_url(repo_root):
+    if not repo_root:
+        raise ValueError("这条记录缺少 repo_root，无法定位本地项目")
+    return run_git(["remote", "get-url", "origin"], cwd=repo_root)
+
+
+def get_gitlab_project(url, token, project_path, project_name=None):
+    if project_path:
+        encoded = quote(project_path, safe="")
+        try:
+            return gitlab_api_request(url, token, f"/api/v4/projects/{encoded}")
+        except RuntimeError:
+            pass
+
+    if not project_name:
+        raise RuntimeError(f"找不到 GitLab 项目: {project_path}")
+
+    query = urlencode({"search": project_name, "membership": "true", "simple": "true", "per_page": "100"})
+    projects = gitlab_api_request(url, token, f"/api/v4/projects?{query}")
+    exact = [
+        project
+        for project in projects
+        if project.get("path") == project_name or project.get("name") == project_name
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise RuntimeError(f"GitLab 上找到多个同名项目 {project_name}，请检查 origin remote")
+    raise RuntimeError(f"GitLab 上找不到项目 {project_name}")
+
+
+def find_open_merge_request(url, token, project_id, source_branch):
+    query = urlencode({"state": "opened", "source_branch": source_branch, "per_page": "20"})
+    merge_requests = gitlab_api_request(url, token, f"/api/v4/projects/{project_id}/merge_requests?{query}")
+    return merge_requests[0] if merge_requests else None
+
+
+def remote_branch_exists(repo_root, branch):
+    result = subprocess.run(
+        ["git", "ls-remote", "--heads", "origin", branch],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(message)
+    return bool(result.stdout.strip())
+
+
+def build_merge_request_title(record):
+    version = record.get("iteration_version") or ""
+    name = record.get("iteration_name") or record.get("branch") or "Merge Request"
+    return f"{version}-{name}" if version else name
+
+
+def build_merge_request_description(record):
+    lines = [
+        f"项目：{record.get('project') or '-'}",
+        f"分支：{record.get('branch') or '-'}",
+        f"迭代版本：{record.get('iteration_version') or '-'}",
+        f"迭代名称：{record.get('iteration_name') or '-'}",
+        "",
+        "由 gc branch ledger 自动创建。",
+    ]
+    return "\n".join(lines)
+
+
+def create_merge_request_for_record(ledger_path, target_id, config_path=DEFAULT_CONFIG, mark_live=False):
+    config, _ = read_config(config_path)
+    url, token = resolve_gitlab_credentials(path=config_path)
+    gitlab = config.get("gitlab", {})
+    target_branch = gitlab.get("default_target_branch", "main")
+
+    records, path, index, record = get_record_by_id(ledger_path, target_id)
+    if record is None:
+        return None
+
+    branch = record.get("branch")
+    repo_root = record.get("repo_root")
+    if not branch:
+        raise ValueError("这条记录缺少分支名")
+
+    origin_url = get_origin_url(repo_root)
+    project_path = parse_gitlab_project_path(origin_url, url)
+    project = get_gitlab_project(url, token, project_path, record.get("project"))
+    project_id = project["id"]
+
+    if not remote_branch_exists(repo_root, branch):
+        raise RuntimeError(f"远端 origin 上还没有分支 {branch}，请先 push 后再提 MR")
+
+    existing = find_open_merge_request(url, token, project_id, branch)
+    if existing:
+        record["mr_url"] = existing.get("web_url")
+        record["mr_iid"] = existing.get("iid")
+        if mark_live:
+            record["status"] = STATUS_LIVE
+        records[index] = record
+        write_records(records, path)
+        return {"created": False, "merge_request": existing, "record": dashboard_record(record, index)}
+
+    payload = {
+        "source_branch": branch,
+        "target_branch": target_branch,
+        "title": build_merge_request_title(record),
+        "description": build_merge_request_description(record),
+        "remove_source_branch": False,
+    }
+    merge_request = gitlab_api_request(
+        url,
+        token,
+        f"/api/v4/projects/{project_id}/merge_requests",
+        method="POST",
+        payload=payload,
+    )
+    record["mr_url"] = merge_request.get("web_url")
+    record["mr_iid"] = merge_request.get("iid")
+    if mark_live:
+        record["status"] = STATUS_LIVE
+    records[index] = record
+    write_records(records, path)
+    return {"created": True, "merge_request": merge_request, "record": dashboard_record(record, index)}
+
+
+def create_merge_requests_for_records(ledger_path, target_ids, config_path=DEFAULT_CONFIG):
+    results = []
+    for target_id in target_ids:
+        try:
+            result = create_merge_request_for_record(
+                ledger_path,
+                target_id,
+                config_path,
+                mark_live=True,
+            )
+            if result is None:
+                results.append({"id": target_id, "ok": False, "error": "记录不存在，页面可能需要刷新"})
+                continue
+
+            record = result.get("record", {})
+            merge_request = result.get("merge_request", {})
+            results.append(
+                {
+                    "id": target_id,
+                    "ok": True,
+                    "created": result.get("created", False),
+                    "project": record.get("project"),
+                    "branch": record.get("branch"),
+                    "web_url": merge_request.get("web_url"),
+                    "record": record,
+                }
+            )
+        except (RuntimeError, ValueError) as error:
+            results.append({"id": target_id, "ok": False, "error": str(error)})
+    return results
+
+
+def read_records(ledger_path):
+    path = Path(os.path.expanduser(ledger_path))
+    if not path.exists():
+        return [], path
+
+    records = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path}:{line_number} 不是有效 JSON：{error}") from error
+    return records, path
+
+
+def filter_records(records, project=None, iteration=None):
+    if project:
+        records = [record for record in records if record.get("project") == project]
+
+    if iteration:
+        records = [
+            record
+            for record in records
+            if record.get("iteration_version") == iteration
+            or record.get("iteration_name") == iteration
+        ]
+
+    return records
+
+
+def filter_indexed_records(indexed_records, project=None, iteration=None):
+    records = indexed_records
+    if project:
+        records = [(index, record) for index, record in records if record.get("project") == project]
+
+    if iteration:
+        records = [
+            (index, record)
+            for index, record in records
+            if record.get("iteration_version") == iteration
+            or record.get("iteration_name") == iteration
+        ]
+
+    return records
+
+
+def normalize_status(status):
+    if status == STATUS_LIVE:
+        return STATUS_LIVE
+    return STATUS_NOT_LIVE
+
+
+def record_id(record, index):
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"{index}-{digest}"
+
+
+def dashboard_record(record, index):
+    return {
+        "_gc_id": record_id(record, index),
+        "base_branch": record.get("base_branch"),
+        "branch": record.get("branch"),
+        "branch_date": record.get("branch_date"),
+        "created_at": record.get("created_at"),
+        "feature_key": record.get("feature_key"),
+        "iteration_name": record.get("iteration_name"),
+        "iteration_version": record.get("iteration_version"),
+        "mr_url": record.get("mr_url"),
+        "project": record.get("project"),
+        "status": normalize_status(record.get("status")),
+    }
+
+
+def delete_record(ledger_path, target_id):
+    records, path = read_records(ledger_path)
+    kept = []
+    deleted = None
+
+    for index, record in enumerate(records):
+        if record_id(record, index) == target_id:
+            deleted = record
+            continue
+        kept.append(record)
+
+    if deleted is None:
+        return None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        for record in kept:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(tmp_path, path)
+    return deleted
+
+
+def update_record_status(ledger_path, target_id, status):
+    if status not in VALID_STATUSES:
+        raise ValueError(f"状态只能是 {STATUS_NOT_LIVE} 或 {STATUS_LIVE}")
+
+    records, path = read_records(ledger_path)
+    updated = None
+    updated_index = None
+
+    for index, record in enumerate(records):
+        if record_id(record, index) == target_id:
+            record["status"] = status
+            updated = record
+            updated_index = index
+            break
+
+    if updated is None:
+        return None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(tmp_path, path)
+    return updated_index, updated
+
+
+def current_git_branch(repo_root):
+    branch = run_git(["branch", "--show-current"], cwd=repo_root)
+    if not branch:
+        raise RuntimeError("当前处于 detached HEAD，无法判断要重命名的分支")
+    return branch
+
+
+def update_ledger_branch(ledger_path, repo_root, old_branch, new_branch, iteration_name=None):
+    records, path = read_records(ledger_path)
+    if not records:
+        return 0, path
+
+    branch_meta = parse_branch_name(new_branch)
+    updated = 0
+    repo_root = str(repo_root)
+
+    for record in records:
+        if record.get("branch") != old_branch:
+            continue
+        if record.get("repo_root") and record.get("repo_root") != repo_root:
+            continue
+
+        record["branch"] = new_branch
+        record["iteration_version"] = branch_meta["iteration_version"]
+        record["feature_key"] = branch_meta["feature_key"]
+        record["branch_date"] = branch_meta["branch_date"]
+        record["owner"] = branch_meta["owner"]
+        if iteration_name:
+            record["iteration_name"] = iteration_name
+        updated += 1
+
+    if updated:
+        write_records(records, path)
+
+    return updated, path
+
+
+def rename_branch(args):
+    branch_meta = parse_branch_name(args.new_branch)
+    repo = get_repo_context()
+    repo_root = repo["repo_root"]
+    old_branch = args.old_branch or current_git_branch(repo_root)
+
+    if old_branch == args.new_branch:
+        raise ValueError("新旧分支名相同，不需要重命名")
+
+    if args.dry_run:
+        print("dry-run: 将执行以下操作")
+        if args.old_branch:
+            print(f"  git branch -m {old_branch} {args.new_branch}")
+        else:
+            print(f"  git branch -m {args.new_branch}")
+    else:
+        if args.old_branch:
+            run_git(["branch", "-m", old_branch, args.new_branch], cwd=repo_root)
+        else:
+            run_git(["branch", "-m", args.new_branch], cwd=repo_root)
+
+    updated, ledger_path = update_ledger_branch(
+        args.ledger,
+        repo_root,
+        old_branch,
+        args.new_branch,
+        iteration_name=args.name,
+    )
+
+    print(f"已重命名分支: {old_branch} -> {args.new_branch}")
+    print(f"迭代版本: {branch_meta['iteration_version'] or '-'}")
+    print(f"功能: {branch_meta['feature_key']}")
+    print(f"日期: {branch_meta['branch_date']}")
+    if args.name:
+        print(f"迭代名称: {args.name}")
+    if updated:
+        print(f"已同步台账记录: {updated} 条")
+    else:
+        print(f"未找到可同步的台账记录: {ledger_path}")
+    print("提示: 如果旧分支已经 push 到远端，需要手动处理远端分支。")
+    return 0
+
+
+def create_branch(args):
+    branch_meta = parse_branch_name(args.branch)
+    repo = get_repo_context()
+
+    if args.dry_run:
+        print("dry-run: 将执行以下操作")
+        print(f"  git checkout -b {args.branch}")
+    else:
+        run_git(["checkout", "-b", args.branch], cwd=repo["repo_root"])
+
+    record = {
+        "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "project": repo["project_name"],
+        "repo_root": repo["repo_root"],
+        "base_branch": repo["base_branch"],
+        "base_sha": repo["base_sha"],
+        "branch": args.branch,
+        "iteration_version": branch_meta["iteration_version"],
+        "iteration_name": args.name,
+        "feature_key": branch_meta["feature_key"],
+        "branch_date": branch_meta["branch_date"],
+        "owner": branch_meta["owner"],
+        "status": STATUS_NOT_LIVE,
+    }
+
+    if args.dry_run:
+        print("dry-run: 将记录以下内容")
+        print(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    ledger = append_record(record, args.ledger)
+
+    print(f"已创建分支: {args.branch}")
+    print(f"项目: {record['project']}")
+    print(f"迭代版本: {record['iteration_version']}")
+    print(f"迭代名称: {record['iteration_name']}")
+    print(f"记录文件: {ledger}")
+    return 0
+
+
+def list_records(args):
+    records, path = read_records(args.ledger)
+    if not records:
+        print(f"还没有记录: {path}")
+        return 0
+
+    records = filter_records(records, project=args.project, iteration=args.iteration)
+
+    if not records:
+        print("没有匹配记录")
+        return 0
+
+    for record in records:
+        print(
+            f"{record.get('project')} | {record.get('iteration_version')} | "
+            f"{record.get('iteration_name')} | {record.get('branch')}"
+        )
+    return 0
+
+
+def render_dashboard(indexed_records, ledger_path):
+    if indexed_records and not isinstance(indexed_records[0], tuple):
+        indexed_records = list(enumerate(indexed_records))
+
+    records = [record for _, record in indexed_records]
+    view_records = [dashboard_record(record, index) for index, record in indexed_records]
+    data = json.dumps(view_records, ensure_ascii=False).replace("</", "<\\/")
+    generated_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    total = len(records)
+    projects = len({record.get("project", "") for record in records if record.get("project")})
+    iterations = len(
+        {record.get("iteration_version", "") for record in records if record.get("iteration_version")}
+    )
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GC Branch Ledger</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --panel-soft: #fbfcfe;
+      --text: #17202b;
+      --muted: #667085;
+      --muted-2: #98a2b3;
+      --line: #d8dee8;
+      --line-soft: #eef1f5;
+      --accent: #0b7a75;
+      --accent-strong: #075f5a;
+      --accent-soft: #e5f4f2;
+      --indigo: #4657c8;
+      --indigo-soft: #eef0ff;
+      --danger: #b42318;
+      --danger-soft: #fff1f0;
+      --danger-line: #f2b8b5;
+      --shadow: 0 18px 44px rgba(20, 31, 46, 0.10);
+      --shadow-soft: 0 1px 2px rgba(16, 24, 40, 0.05);
+    }}
+
+    * {{ box-sizing: border-box; }}
+
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(180deg, #eef3f7 0, var(--bg) 240px);
+      color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    }}
+
+    header {{
+      border-bottom: 1px solid rgba(216, 222, 232, 0.78);
+      background: rgba(255, 255, 255, 0.86);
+      backdrop-filter: blur(14px);
+      position: sticky;
+      top: 0;
+      z-index: 3;
+    }}
+
+    .wrap {{
+      width: min(1540px, calc(100vw - 96px));
+      margin: 0 auto;
+    }}
+
+    .topbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 24px 0 18px;
+    }}
+
+    .title-row {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }}
+
+    .brand-mark {{
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border: 1px solid rgba(11, 122, 117, 0.20);
+      border-radius: 8px;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      font-weight: 800;
+      box-shadow: var(--shadow-soft);
+    }}
+
+    h1 {{
+      margin: 0;
+      font-size: 23px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }}
+
+    .sub {{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+      word-break: break-all;
+    }}
+
+    .stats {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(96px, 1fr));
+      gap: 12px;
+      min-width: 360px;
+    }}
+
+    .header-side {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }}
+
+    .stat {{
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: var(--panel);
+      box-shadow: var(--shadow-soft);
+    }}
+
+    .stat strong {{
+      display: block;
+      font-size: 22px;
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }}
+
+    .stat span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+
+    .filters {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1.6fr) minmax(150px, 0.9fr) minmax(150px, 0.9fr) minmax(150px, 0.9fr) 104px;
+      gap: 12px;
+      padding: 0 0 18px;
+    }}
+
+    input, select, button {{
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 0 13px;
+      font: inherit;
+      outline: none;
+      transition: border-color 150ms ease, box-shadow 150ms ease, background 150ms ease, transform 150ms ease;
+    }}
+
+    input:focus, select:focus {{
+      border-color: rgba(11, 122, 117, 0.48);
+      box-shadow: 0 0 0 3px rgba(11, 122, 117, 0.12);
+    }}
+
+    input::placeholder {{
+      color: var(--muted-2);
+    }}
+
+    button {{
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+      font-weight: 650;
+    }}
+
+    button:hover {{
+      background: var(--accent-strong);
+      transform: translateY(-1px);
+    }}
+
+    button:active {{
+      transform: translateY(0);
+    }}
+
+    button.secondary {{
+      background: var(--panel);
+      border-color: var(--line);
+      color: var(--text);
+      box-shadow: var(--shadow-soft);
+    }}
+
+    button.secondary:hover {{
+      background: #f8fafc;
+      border-color: #c7d0dd;
+    }}
+
+    button.danger {{
+      background: var(--danger-soft);
+      border-color: var(--danger-line);
+      color: var(--danger);
+      min-width: 72px;
+      height: 32px;
+      padding: 0 11px;
+    }}
+
+    button.danger:hover {{
+      background: #ffe8e6;
+      border-color: var(--danger);
+      transform: none;
+    }}
+
+    .actions {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }}
+
+    button.status-button {{
+      min-width: 72px;
+      height: 32px;
+      padding: 0 11px;
+      background: #fff8e7;
+      border-color: #f2d28f;
+      color: #8a5a00;
+    }}
+
+    button.status-button.is-live {{
+      background: var(--accent-soft);
+      border-color: rgba(11, 122, 117, 0.24);
+      color: var(--accent);
+    }}
+
+    button.status-button:hover {{
+      transform: none;
+      background: #fff3cf;
+      border-color: #d39b28;
+    }}
+
+    button.status-button.is-live:hover {{
+      background: #d9efec;
+      border-color: rgba(11, 122, 117, 0.42);
+    }}
+
+    button.mr-button {{
+      min-width: 62px;
+      height: 32px;
+      padding: 0 11px;
+      background: var(--indigo-soft);
+      border-color: rgba(70, 87, 200, 0.18);
+      color: var(--indigo);
+    }}
+
+    button.mr-button:hover {{
+      transform: none;
+      background: #e2e6ff;
+      border-color: rgba(70, 87, 200, 0.38);
+    }}
+
+    main {{
+      padding: 24px 0 38px;
+    }}
+
+    .summary {{
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }}
+
+    .summary strong {{
+      color: var(--text);
+      font-weight: 700;
+    }}
+
+    .table-shell {{
+      overflow: hidden;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }}
+
+    .table-scroll {{
+      overflow-x: auto;
+    }}
+
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }}
+
+    th, td {{
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line-soft);
+      text-align: left;
+      vertical-align: middle;
+      overflow-wrap: anywhere;
+    }}
+
+    th {{
+      background: var(--panel-soft);
+      color: #475467;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }}
+
+    tr:last-child td {{
+      border-bottom: 0;
+    }}
+
+    tbody tr {{
+      transition: background 140ms ease;
+    }}
+
+    tbody tr:hover {{
+      background: #fbfcfd;
+    }}
+
+    .project-name {{
+      font-weight: 700;
+    }}
+
+    .branch {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      color: #263445;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+
+    .pill {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid rgba(11, 122, 117, 0.16);
+      border-radius: 8px;
+      padding: 2px 10px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }}
+
+    .base-pill {{
+      display: inline-block;
+      width: auto;
+      max-width: 100%;
+      box-sizing: border-box;
+      min-height: 24px;
+      border: 1px solid rgba(70, 87, 200, 0.16);
+      border-radius: 8px;
+      padding: 2px 9px;
+      background: var(--indigo-soft);
+      color: var(--indigo);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.35;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      vertical-align: middle;
+    }}
+
+    .base-cell {{
+      overflow-wrap: anywhere;
+    }}
+
+    .date-cell {{
+      white-space: nowrap;
+    }}
+
+    .muted {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+
+    .empty {{
+      padding: 36px;
+      text-align: center;
+      color: var(--muted);
+      border-top: 1px solid var(--line-soft);
+    }}
+
+    .pagination {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 14px 16px;
+      border-top: 1px solid var(--line-soft);
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 13px;
+    }}
+
+    .pagination select {{
+      width: 104px;
+      height: 32px;
+      padding: 0 8px;
+    }}
+
+    .pager {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+
+    .pager button {{
+      min-width: 32px;
+      height: 32px;
+      padding: 0 9px;
+      background: var(--panel);
+      border-color: var(--line);
+      color: var(--text);
+      box-shadow: none;
+    }}
+
+    .pager button:hover {{
+      background: #f8fafc;
+      transform: none;
+    }}
+
+    .pager button.active {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }}
+
+    .pager button:disabled {{
+      cursor: not-allowed;
+      color: var(--muted-2);
+      background: #f8fafc;
+    }}
+
+    .modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(15, 23, 42, 0.34);
+      z-index: 10;
+    }}
+
+    .modal-backdrop[hidden] {{
+      display: none;
+    }}
+
+    .modal {{
+      width: min(520px, 100%);
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.24);
+    }}
+
+    .modal.wide {{
+      width: min(760px, 100%);
+    }}
+
+    .modal-head {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 20px 22px 14px;
+      border-bottom: 1px solid var(--line-soft);
+    }}
+
+    .modal-title {{
+      margin: 0;
+      font-size: 18px;
+      font-weight: 750;
+    }}
+
+    .modal-body {{
+      display: grid;
+      gap: 14px;
+      padding: 18px 22px 20px;
+    }}
+
+    .field {{
+      display: grid;
+      gap: 7px;
+    }}
+
+    .field label {{
+      color: #344054;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+
+    .field-note {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+
+    .modal-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      padding-top: 4px;
+    }}
+
+    .modal-status {{
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+
+    .modal-status.ok {{
+      color: var(--accent);
+    }}
+
+    .modal-status.error {{
+      color: var(--danger);
+    }}
+
+    .mr-list {{
+      display: grid;
+      gap: 8px;
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 4px;
+    }}
+
+    .mr-item {{
+      display: grid;
+      grid-template-columns: 22px 1fr;
+      gap: 10px;
+      align-items: start;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel-soft);
+    }}
+
+    .mr-item input {{
+      width: 16px;
+      height: 16px;
+      margin: 3px 0 0;
+      padding: 0;
+    }}
+
+    .mr-item-title {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-weight: 750;
+    }}
+
+    .mr-item-meta {{
+      margin-top: 4px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }}
+
+    .mr-results {{
+      display: grid;
+      gap: 6px;
+      max-height: 160px;
+      overflow: auto;
+    }}
+
+    .mr-result {{
+      font-size: 13px;
+      color: var(--muted);
+    }}
+
+    .mr-result.ok {{
+      color: var(--accent);
+    }}
+
+    .mr-result.error {{
+      color: var(--danger);
+    }}
+
+    @media (max-width: 860px) {{
+      .topbar {{
+        align-items: stretch;
+        flex-direction: column;
+      }}
+
+      .header-side {{
+        align-items: stretch;
+        flex-direction: column;
+      }}
+
+      .stats {{
+        min-width: 0;
+        grid-template-columns: repeat(3, 1fr);
+      }}
+
+      .filters {{
+        grid-template-columns: 1fr;
+      }}
+
+      .table-scroll {{
+        overflow-x: auto;
+      }}
+
+      table {{
+        min-width: 1040px;
+      }}
+    }}
+
+    @media (max-width: 560px) {{
+      .wrap {{
+        width: min(100vw - 22px, 1540px);
+      }}
+
+      .title-row {{
+        align-items: flex-start;
+      }}
+
+      .brand-mark {{
+        width: 34px;
+        height: 34px;
+      }}
+
+      .stats {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="topbar">
+        <div class="title-row">
+          <div class="brand-mark">GC</div>
+          <div>
+            <h1>Branch Ledger</h1>
+            <div class="sub">数据源：{html.escape(Path(ledger_path).name)} · 生成时间：{html.escape(generated_at)}</div>
+          </div>
+        </div>
+        <div class="header-side">
+          <button id="bulkMrButton" type="button">提 MR</button>
+          <button id="gitlabSettings" class="secondary" type="button">GitLab 设置</button>
+          <div class="stats" aria-label="记录统计">
+            <div class="stat"><strong>{total}</strong><span>分支记录</span></div>
+            <div class="stat"><strong>{projects}</strong><span>项目</span></div>
+            <div class="stat"><strong>{iterations}</strong><span>迭代版本</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="filters">
+        <input id="search" type="search" placeholder="搜索分支、迭代名称、功能、项目">
+        <select id="project"><option value="">全部项目</option></select>
+        <select id="iteration"><option value="">全部迭代</option></select>
+        <select id="statusFilter"><option value="">全部状态</option><option value="未上线">未上线</option><option value="已上线">已上线</option></select>
+        <button id="reset" type="button">重置</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="summary" class="summary"></div>
+    <div class="table-shell">
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 30%">项目</th>
+              <th style="width: 8%">迭代</th>
+              <th style="width: 13%">迭代名称</th>
+              <th style="width: 16%">分支</th>
+              <th style="width: 14%">Base</th>
+              <th style="width: 7%">日期</th>
+              <th style="width: 12%">操作</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div id="empty" class="empty" hidden>没有匹配记录</div>
+      <div class="pagination">
+        <span id="pageTotal"></span>
+        <select id="pageSize">
+          <option value="10">10条/页</option>
+          <option value="20">20条/页</option>
+          <option value="30">30条/页</option>
+        </select>
+        <div id="pager" class="pager"></div>
+      </div>
+    </div>
+  </main>
+
+  <div id="gitlabModal" class="modal-backdrop" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="gitlabModalTitle">
+      <div class="modal-head">
+        <div>
+          <h2 id="gitlabModalTitle" class="modal-title">GitLab 设置</h2>
+          <div id="gitlabTokenHint" class="sub">Access Token 只保存在本机配置文件。</div>
+        </div>
+        <button id="closeGitlabModal" class="secondary" type="button">关闭</button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label for="gitlabUrl">GitLab 地址</label>
+          <input id="gitlabUrl" type="url" placeholder="https://gitlab.example.com">
+        </div>
+        <div class="field">
+          <label for="gitlabToken">Access Token</label>
+          <input id="gitlabToken" type="password" autocomplete="off" placeholder="首次配置必填；之后留空则保持不变">
+          <div id="gitlabSavedToken" class="field-note"></div>
+        </div>
+        <div class="field">
+          <label for="gitlabTarget">默认目标分支</label>
+          <input id="gitlabTarget" type="text" placeholder="main">
+        </div>
+        <div id="gitlabStatus" class="modal-status"></div>
+        <div class="modal-actions">
+          <button id="testGitlab" class="secondary" type="button">测试连接</button>
+          <button id="saveGitlab" type="button">保存</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="bulkMrModal" class="modal-backdrop" hidden>
+    <section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="bulkMrModalTitle">
+      <div class="modal-head">
+        <div>
+          <h2 id="bulkMrModalTitle" class="modal-title">批量提 MR</h2>
+          <div class="sub">仅展示状态为未上线的记录。成功创建或找到已有 MR 后会自动标记为已上线。</div>
+        </div>
+        <button id="closeBulkMrModal" class="secondary" type="button">关闭</button>
+      </div>
+      <div class="modal-body">
+        <div id="bulkMrList" class="mr-list"></div>
+        <div id="bulkMrStatus" class="modal-status"></div>
+        <div id="bulkMrResults" class="mr-results"></div>
+        <div class="modal-actions">
+          <button id="selectAllMr" class="secondary" type="button">全选</button>
+          <button id="submitBulkMr" type="button">提交选中 MR</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script id="records-data" type="application/json">{data}</script>
+  <script>
+    let records = JSON.parse(document.getElementById("records-data").textContent);
+    const rows = document.getElementById("rows");
+    const empty = document.getElementById("empty");
+    const summary = document.getElementById("summary");
+    const search = document.getElementById("search");
+    const project = document.getElementById("project");
+    const iteration = document.getElementById("iteration");
+    const statusFilter = document.getElementById("statusFilter");
+    const reset = document.getElementById("reset");
+    const pageTotal = document.getElementById("pageTotal");
+    const pageSize = document.getElementById("pageSize");
+    const pager = document.getElementById("pager");
+    const gitlabSettings = document.getElementById("gitlabSettings");
+    const gitlabModal = document.getElementById("gitlabModal");
+    const closeGitlabModal = document.getElementById("closeGitlabModal");
+    const gitlabUrl = document.getElementById("gitlabUrl");
+    const gitlabToken = document.getElementById("gitlabToken");
+    const gitlabTarget = document.getElementById("gitlabTarget");
+    const gitlabSavedToken = document.getElementById("gitlabSavedToken");
+    const gitlabStatus = document.getElementById("gitlabStatus");
+    const testGitlab = document.getElementById("testGitlab");
+    const saveGitlab = document.getElementById("saveGitlab");
+    const bulkMrButton = document.getElementById("bulkMrButton");
+    const bulkMrModal = document.getElementById("bulkMrModal");
+    const closeBulkMrModal = document.getElementById("closeBulkMrModal");
+    const bulkMrList = document.getElementById("bulkMrList");
+    const bulkMrStatus = document.getElementById("bulkMrStatus");
+    const bulkMrResults = document.getElementById("bulkMrResults");
+    const selectAllMr = document.getElementById("selectAllMr");
+    const submitBulkMr = document.getElementById("submitBulkMr");
+
+    const STATUS_NOT_LIVE = "未上线";
+    const STATUS_LIVE = "已上线";
+    let currentPage = 1;
+    const text = (value) => value == null || value === "" ? "-" : String(value);
+    const escapeHtml = (value) => text(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+    const escapeAttr = (value) => String(value == null ? "" : value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+    const key = (record) => [
+      record.project,
+      record.iteration_version,
+      record.iteration_name,
+      record.branch,
+      record.feature_key,
+      record.base_branch
+    ].map(text).join(" ").toLowerCase();
+
+    function option(value, label) {{
+      const item = document.createElement("option");
+      item.value = value;
+      item.textContent = label;
+      return item;
+    }}
+
+    function fillFilters() {{
+      [...new Set(records.map((record) => record.project).filter(Boolean))]
+        .sort()
+        .forEach((value) => project.appendChild(option(value, value)));
+
+      [...new Set(records.map((record) => record.iteration_version).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b, undefined, {{ numeric: true }}))
+        .forEach((value) => iteration.appendChild(option(value, value)));
+    }}
+
+    function formatDate(value) {{
+      if (!value) return "-";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleDateString("zh-CN", {{ month: "2-digit", day: "2-digit" }});
+    }}
+
+    async function apiJson(url, options = {{}}) {{
+      const response = await fetch(url, options);
+      const text = await response.text();
+      let payload = null;
+      try {{
+        payload = text ? JSON.parse(text) : null;
+      }} catch (_) {{
+        payload = null;
+      }}
+
+      if (!response.ok) {{
+        throw new Error(payload && payload.error ? payload.error : text || "请求失败");
+      }}
+
+      return payload;
+    }}
+
+    function setGitlabStatus(message, kind = "") {{
+      gitlabStatus.textContent = message;
+      gitlabStatus.className = kind ? `modal-status ${{kind}}` : "modal-status";
+    }}
+
+    function setBulkMrStatus(message, kind = "") {{
+      bulkMrStatus.textContent = message;
+      bulkMrStatus.className = kind ? `modal-status ${{kind}}` : "modal-status";
+    }}
+
+    function applyGitlabConfig(config) {{
+      const gitlab = config.gitlab || {{}};
+      gitlabUrl.value = gitlab.url || "";
+      gitlabTarget.value = gitlab.default_target_branch || "main";
+      gitlabToken.value = "";
+      gitlabSavedToken.textContent = gitlab.has_token
+        ? `已保存 Token：${{gitlab.token_masked}}。留空保存会继续使用它。`
+        : "尚未保存 Token。";
+    }}
+
+    async function loadGitlabConfig() {{
+      setGitlabStatus("正在读取配置...");
+      const config = await apiJson("/api/config");
+      applyGitlabConfig(config);
+      setGitlabStatus("");
+    }}
+
+    function gitlabPayload() {{
+      return {{
+        url: gitlabUrl.value.trim(),
+        token: gitlabToken.value.trim(),
+        default_target_branch: gitlabTarget.value.trim() || "main"
+      }};
+    }}
+
+    async function openGitlabSettings() {{
+      gitlabModal.hidden = false;
+      try {{
+        await loadGitlabConfig();
+      }} catch (error) {{
+        setGitlabStatus(error.message, "error");
+      }}
+      gitlabUrl.focus();
+    }}
+
+    function closeGitlabSettings() {{
+      gitlabModal.hidden = true;
+      setGitlabStatus("");
+    }}
+
+    async function saveGitlabConfig() {{
+      setGitlabStatus("正在保存...");
+      try {{
+        const result = await apiJson("/api/config", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(gitlabPayload())
+        }});
+        applyGitlabConfig(result);
+        setGitlabStatus("已保存 GitLab 设置", "ok");
+      }} catch (error) {{
+        setGitlabStatus(error.message, "error");
+      }}
+    }}
+
+    async function testGitlabConnection() {{
+      setGitlabStatus("正在测试连接...");
+      try {{
+        const result = await apiJson("/api/gitlab/test", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(gitlabPayload())
+        }});
+        const name = result.name && result.username
+          ? `${{result.name}} @${{result.username}}`
+          : result.username || result.name || "当前用户";
+        setGitlabStatus(`连接成功：${{name}}`, "ok");
+      }} catch (error) {{
+        setGitlabStatus(error.message, "error");
+      }}
+    }}
+
+    function normalizedStatus(record) {{
+      return record.status === STATUS_LIVE ? STATUS_LIVE : STATUS_NOT_LIVE;
+    }}
+
+    function statusRank(record) {{
+      return normalizedStatus(record) === STATUS_NOT_LIVE ? 0 : 1;
+    }}
+
+    function compareRecords(a, b) {{
+      const statusDiff = statusRank(a) - statusRank(b);
+      if (statusDiff) return statusDiff;
+      return text(b.created_at || b.branch_date).localeCompare(text(a.created_at || a.branch_date), undefined, {{ numeric: true }});
+    }}
+
+    function upsertRecord(updated, oldId = "") {{
+      if (!updated || !updated._gc_id) return;
+      const index = records.findIndex((record) => record._gc_id === (oldId || updated._gc_id));
+      if (index >= 0) {{
+        records[index] = updated;
+      }} else {{
+        records.push(updated);
+      }}
+    }}
+
+    function removeRecord(id) {{
+      records = records.filter((record) => record._gc_id !== id);
+    }}
+
+    function mrCandidates() {{
+      return records.filter((record) => normalizedStatus(record) === STATUS_NOT_LIVE);
+    }}
+
+    function renderBulkMrList() {{
+      const candidates = mrCandidates();
+      bulkMrResults.innerHTML = "";
+      bulkMrList.innerHTML = "";
+
+      if (!candidates.length) {{
+        bulkMrList.innerHTML = `<div class="empty">没有未上线记录</div>`;
+        submitBulkMr.disabled = true;
+        setBulkMrStatus("");
+        return;
+      }}
+
+      submitBulkMr.disabled = false;
+      setBulkMrStatus(`可选择 ${{candidates.length}} 条未上线记录`);
+      for (const record of candidates) {{
+        const item = document.createElement("label");
+        item.className = "mr-item";
+        item.innerHTML = `
+          <input type="checkbox" value="${{escapeAttr(record._gc_id)}}" checked>
+          <div>
+            <div class="mr-item-title">
+              <span>${{escapeHtml(record.project)}}</span>
+              <span class="pill">${{escapeHtml(record.iteration_version)}}</span>
+              <span>${{escapeHtml(record.iteration_name)}}</span>
+            </div>
+            <div class="mr-item-meta">${{escapeHtml(record.branch)}}</div>
+          </div>
+        `;
+        bulkMrList.appendChild(item);
+      }}
+    }}
+
+    function openBulkMrModal() {{
+      bulkMrModal.hidden = false;
+      renderBulkMrList();
+    }}
+
+    function closeBulkMrSettings() {{
+      bulkMrModal.hidden = true;
+      setBulkMrStatus("");
+      bulkMrResults.innerHTML = "";
+    }}
+
+    function filteredRecords() {{
+      const query = search.value.trim().toLowerCase();
+      return records
+        .filter((record) => {{
+          if (project.value && record.project !== project.value) return false;
+          if (iteration.value && record.iteration_version !== iteration.value) return false;
+          if (statusFilter.value && normalizedStatus(record) !== statusFilter.value) return false;
+          if (query && !key(record).includes(query)) return false;
+          return true;
+        }})
+        .sort(compareRecords);
+    }}
+
+    function visiblePageNumbers(totalPages) {{
+      const pages = new Set([1, totalPages]);
+      for (let page = currentPage - 1; page <= currentPage + 1; page += 1) {{
+        if (page >= 1 && page <= totalPages) pages.add(page);
+      }}
+      return [...pages].sort((a, b) => a - b);
+    }}
+
+    function renderPager(total, totalPages) {{
+      pageTotal.textContent = `共 ${{total}} 条`;
+      pager.innerHTML = "";
+
+      const prev = document.createElement("button");
+      prev.type = "button";
+      prev.textContent = "上一页";
+      prev.disabled = currentPage <= 1;
+      prev.addEventListener("click", () => {{
+        currentPage = Math.max(1, currentPage - 1);
+        render();
+      }});
+      pager.appendChild(prev);
+
+      let lastPage = 0;
+      for (const page of visiblePageNumbers(totalPages)) {{
+        if (page - lastPage > 1) {{
+          const ellipsis = document.createElement("span");
+          ellipsis.textContent = "...";
+          pager.appendChild(ellipsis);
+        }}
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = String(page);
+        button.className = page === currentPage ? "active" : "";
+        button.addEventListener("click", () => {{
+          currentPage = page;
+          render();
+        }});
+        pager.appendChild(button);
+        lastPage = page;
+      }}
+
+      const next = document.createElement("button");
+      next.type = "button";
+      next.textContent = "下一页";
+      next.disabled = currentPage >= totalPages;
+      next.addEventListener("click", () => {{
+        currentPage = Math.min(totalPages, currentPage + 1);
+        render();
+      }});
+      pager.appendChild(next);
+    }}
+
+    function render() {{
+      const filtered = filteredRecords();
+      const size = Number(pageSize.value || 10);
+      const totalPages = Math.max(1, Math.ceil(filtered.length / size));
+      currentPage = Math.min(Math.max(1, currentPage), totalPages);
+      const start = (currentPage - 1) * size;
+      const pageRecords = filtered.slice(start, start + size);
+
+      rows.innerHTML = "";
+      empty.hidden = filtered.length > 0;
+      summary.innerHTML = `<span>显示 <strong>${{pageRecords.length}}</strong> / ${{filtered.length}} 条匹配记录，全部 ${{records.length}} 条</span>`;
+
+      for (const record of pageRecords) {{
+        const row = document.createElement("tr");
+        const status = normalizedStatus(record);
+        const statusClass = status === STATUS_LIVE ? "status-button is-live" : "status-button";
+        const nextStatus = status === STATUS_LIVE ? STATUS_NOT_LIVE : STATUS_LIVE;
+        row.innerHTML = `
+          <td><span class="project-name">${{escapeHtml(record.project)}}</span></td>
+          <td><span class="pill">${{escapeHtml(record.iteration_version)}}</span></td>
+          <td>${{escapeHtml(record.iteration_name)}}</td>
+          <td class="branch">${{escapeHtml(record.branch)}}</td>
+          <td class="base-cell"><span class="base-pill">${{escapeHtml(record.base_branch)}}</span></td>
+          <td class="muted date-cell">${{escapeHtml(formatDate(record.created_at || record.branch_date))}}</td>
+          <td>
+            <div class="actions">
+              <button class="${{statusClass}}" type="button" data-status-id="${{escapeAttr(record._gc_id)}}" data-next-status="${{escapeAttr(nextStatus)}}">${{escapeHtml(status)}}</button>
+              <button class="danger" type="button" data-delete="${{escapeAttr(record._gc_id)}}">删除</button>
+            </div>
+          </td>
+        `;
+        rows.appendChild(row);
+      }}
+      renderPager(filtered.length, totalPages);
+    }}
+
+    async function updateStatus(id, status) {{
+      const response = await fetch("/api/status", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ id, status }})
+      }});
+
+      if (!response.ok) {{
+        const message = await response.text();
+        window.alert(message || "状态更新失败");
+        return;
+      }}
+
+      const payload = await response.json();
+      upsertRecord(payload.record, payload.old_id);
+      render();
+      if (!bulkMrModal.hidden) renderBulkMrList();
+    }}
+
+    async function submitBulkMergeRequests() {{
+      const ids = Array.from(bulkMrList.querySelectorAll("input[type='checkbox']:checked"))
+        .map((input) => input.value);
+      if (!ids.length) {{
+        setBulkMrStatus("请至少选择一条记录", "error");
+        return;
+      }}
+
+      submitBulkMr.disabled = true;
+      setBulkMrStatus(`正在提交 ${{ids.length}} 个 MR...`);
+      bulkMrResults.innerHTML = "";
+
+      const response = await fetch("/api/mrs", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ ids }})
+      }});
+
+      const textBody = await response.text();
+      let payload = null;
+      try {{
+        payload = textBody ? JSON.parse(textBody) : null;
+      }} catch (_) {{
+        payload = null;
+      }}
+
+      if (!response.ok) {{
+        setBulkMrStatus((payload && payload.error) || textBody || "批量创建 MR 失败", "error");
+        submitBulkMr.disabled = false;
+        return;
+      }}
+
+      const results = (payload && payload.results) || [];
+      const okCount = results.filter((item) => item.ok).length;
+      setBulkMrStatus(`完成：${{okCount}} / ${{results.length}} 个成功`, okCount === results.length ? "ok" : "error");
+      bulkMrResults.innerHTML = results.map((item) => {{
+        if (item.ok) {{
+          upsertRecord(item.record, item.id);
+          const label = item.created ? "已创建" : "已有";
+          const link = item.web_url ? ` <a href="${{escapeAttr(item.web_url)}}" target="_blank" rel="noopener noreferrer">打开</a>` : "";
+          return `<div class="mr-result ok">${{escapeHtml(label)}}：${{escapeHtml(item.project)}} / ${{escapeHtml(item.branch)}}${{link}}</div>`;
+        }}
+        return `<div class="mr-result error">失败：${{escapeHtml(item.error)}}</div>`;
+      }}).join("");
+
+      render();
+      renderBulkMrList();
+      if (okCount) {{
+        setBulkMrStatus(`完成：${{okCount}} / ${{results.length}} 个成功，列表已更新`, okCount === results.length ? "ok" : "error");
+      }}
+      submitBulkMr.disabled = false;
+    }}
+
+    async function deleteRecord(id) {{
+      const record = records.find((item) => item._gc_id === id);
+      if (!record) return;
+      const ok = window.confirm(`确认删除记录？\\n${{text(record.project)}} / ${{text(record.branch)}}`);
+      if (!ok) return;
+
+      const response = await fetch("/api/delete", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ id }})
+      }});
+
+      if (!response.ok) {{
+        const message = await response.text();
+        window.alert(message || "删除失败");
+        return;
+      }}
+
+      removeRecord(id);
+      render();
+      if (!bulkMrModal.hidden) renderBulkMrList();
+    }}
+
+    fillFilters();
+    render();
+    const rerenderFromFirstPage = () => {{
+      currentPage = 1;
+      render();
+    }};
+    bulkMrButton.addEventListener("click", openBulkMrModal);
+    closeBulkMrModal.addEventListener("click", closeBulkMrSettings);
+    bulkMrModal.addEventListener("click", (event) => {{
+      if (event.target === bulkMrModal) closeBulkMrSettings();
+    }});
+    selectAllMr.addEventListener("click", () => {{
+      bulkMrList.querySelectorAll("input[type='checkbox']").forEach((input) => input.checked = true);
+    }});
+    submitBulkMr.addEventListener("click", submitBulkMergeRequests);
+    gitlabSettings.addEventListener("click", openGitlabSettings);
+    closeGitlabModal.addEventListener("click", closeGitlabSettings);
+    gitlabModal.addEventListener("click", (event) => {{
+      if (event.target === gitlabModal) closeGitlabSettings();
+    }});
+    saveGitlab.addEventListener("click", saveGitlabConfig);
+    testGitlab.addEventListener("click", testGitlabConnection);
+    [search, project, iteration, statusFilter].forEach((control) => control.addEventListener("input", rerenderFromFirstPage));
+    pageSize.addEventListener("input", rerenderFromFirstPage);
+    rows.addEventListener("click", (event) => {{
+      const statusButton = event.target.closest("[data-status-id]");
+      if (statusButton) {{
+        updateStatus(statusButton.dataset.statusId, statusButton.dataset.nextStatus);
+        return;
+      }}
+
+      const deleteButton = event.target.closest("[data-delete]");
+      if (deleteButton) deleteRecord(deleteButton.dataset.delete);
+    }});
+    reset.addEventListener("click", () => {{
+      search.value = "";
+      project.value = "";
+      iteration.value = "";
+      statusFilter.value = "";
+      rerenderFromFirstPage();
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+class GcWebHandler(http.server.BaseHTTPRequestHandler):
+    ledger = DEFAULT_LEDGER
+    config = DEFAULT_CONFIG
+    project = None
+    iteration = None
+
+    def log_message(self, format, *args):
+        return
+
+    def send_text(self, status, content, content_type="text/plain; charset=utf-8"):
+        body = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, status, payload):
+        self.send_text(status, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
+
+    def do_GET(self):
+        route = urlparse(self.path).path
+        if route == "/api/config":
+            self.get_config()
+            return
+
+        if route not in ("/", "/index.html"):
+            self.send_text(404, "Not found")
+            return
+
+        try:
+            records, ledger_path = read_records(self.ledger)
+            records = filter_indexed_records(
+                list(enumerate(records)),
+                project=self.project,
+                iteration=self.iteration,
+            )
+            self.send_text(200, render_dashboard(records, ledger_path), "text/html; charset=utf-8")
+        except ValueError as error:
+            self.send_text(500, str(error))
+
+    def do_POST(self):
+        route = urlparse(self.path).path
+        if route == "/api/config":
+            self.save_config()
+            return
+
+        if route == "/api/gitlab/test":
+            self.test_gitlab()
+            return
+
+        if route == "/api/mr":
+            self.create_merge_request()
+            return
+
+        if route == "/api/mrs":
+            self.create_merge_requests()
+            return
+
+        if route == "/api/status":
+            self.update_status()
+            return
+
+        if route == "/api/delete":
+            self.delete_record()
+            return
+
+        self.send_text(404, "Not found")
+
+    def read_json_payload(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(content_length).decode("utf-8")
+        return json.loads(body)
+
+    def get_config(self):
+        try:
+            config, _ = read_config(self.config)
+            self.send_json(200, {"gitlab": public_gitlab_config(config)})
+        except ValueError as error:
+            self.send_text(500, str(error))
+
+    def save_config(self):
+        try:
+            payload = self.read_json_payload()
+            gitlab, path = save_gitlab_config(payload, self.config)
+        except (KeyError, json.JSONDecodeError, ValueError) as error:
+            self.send_text(400, f"保存失败：{error}")
+            return
+
+        self.send_json(200, {"saved": True, "path": str(path), "gitlab": gitlab})
+
+    def test_gitlab(self):
+        try:
+            payload = self.read_json_payload()
+            result = test_gitlab_connection(payload, self.config)
+        except (KeyError, json.JSONDecodeError, RuntimeError, ValueError) as error:
+            self.send_text(400, f"测试失败：{error}")
+            return
+
+        self.send_json(200, result)
+
+    def create_merge_request(self):
+        try:
+            payload = self.read_json_payload()
+            target_id = payload["id"]
+            result = create_merge_request_for_record(self.ledger, target_id, self.config)
+        except (KeyError, json.JSONDecodeError, RuntimeError, ValueError) as error:
+            self.send_text(400, f"创建 MR 失败：{error}")
+            return
+
+        if result is None:
+            self.send_text(404, "创建 MR 失败：记录不存在，页面可能需要刷新")
+            return
+
+        self.send_json(200, result)
+
+    def create_merge_requests(self):
+        try:
+            payload = self.read_json_payload()
+            target_ids = payload["ids"]
+            if not isinstance(target_ids, list):
+                raise ValueError("ids 必须是数组")
+            result = create_merge_requests_for_records(self.ledger, target_ids, self.config)
+        except (KeyError, json.JSONDecodeError, RuntimeError, ValueError) as error:
+            self.send_text(400, f"批量创建 MR 失败：{error}")
+            return
+
+        self.send_json(200, {"results": result})
+
+    def update_status(self):
+        old_id = None
+        try:
+            payload = self.read_json_payload()
+            target_id = payload["id"]
+            old_id = target_id
+            status = payload["status"]
+            updated = update_record_status(self.ledger, target_id, status)
+        except (KeyError, json.JSONDecodeError, ValueError) as error:
+            self.send_text(400, f"状态更新失败：{error}")
+            return
+
+        if updated is None:
+            self.send_text(404, "状态更新失败：记录不存在，页面可能需要刷新")
+            return
+
+        index, updated_record = updated
+        record = dashboard_record(updated_record, index)
+        self.send_json(200, {"updated": True, "old_id": old_id, "record": record})
+
+    def delete_record(self):
+        try:
+            payload = self.read_json_payload()
+            target_id = payload["id"]
+            deleted = delete_record(self.ledger, target_id)
+        except (KeyError, json.JSONDecodeError, ValueError) as error:
+            self.send_text(400, f"删除失败：{error}")
+            return
+
+        if deleted is None:
+            self.send_text(404, "删除失败：记录不存在，页面可能需要刷新")
+            return
+
+        self.send_json(200, {"deleted": True})
+
+def find_available_port(host, start_port):
+    for port in range(start_port, start_port + 50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((host, port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"{host}:{start_port}-{start_port + 49} 都不可用")
+
+
+def web_dashboard(args):
+    handler = type(
+        "ConfiguredGcWebHandler",
+        (GcWebHandler,),
+        {
+            "ledger": args.ledger,
+            "config": args.config,
+            "project": args.project,
+            "iteration": args.iteration,
+        },
+    )
+    port = find_available_port(args.host, args.port)
+    server = http.server.ThreadingHTTPServer((args.host, port), handler)
+    url = f"http://{args.host}:{port}/"
+    print(f"GC 可视化页面: {url}")
+    print("按 Ctrl+C 停止服务")
+
+    if not args.no_open:
+        opened = webbrowser.open(url)
+        if not opened:
+            print("浏览器没有自动打开，可以手动打开上面的地址。")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止 GC 可视化服务")
+    finally:
+        server.server_close()
+
+    return 0
+
+
+def add_ledger_argument(parser):
+    parser.add_argument(
+        "--ledger",
+        default=DEFAULT_LEDGER,
+        help=f"记录文件路径，默认 {DEFAULT_LEDGER}",
+    )
+
+
+def build_create_parser():
+    parser = argparse.ArgumentParser(
+        prog="gc",
+        description="创建 Git 分支并记录项目、迭代版本、迭代名称和分支名。",
+    )
+    add_ledger_argument(parser)
+    parser.add_argument("branch", help="要创建的分支名")
+    parser.add_argument("-n", "--name", help="迭代名称，例如：同行账号监控")
+    parser.add_argument("--dry-run", action="store_true", help="只预览，不创建分支或写记录")
+    parser.set_defaults(func=create_branch)
+    return parser
+
+
+def build_list_parser():
+    parser = argparse.ArgumentParser(
+        prog="gc list",
+        description="查看 gc 已记录的分支。",
+    )
+    add_ledger_argument(parser)
+    parser.add_argument("--project", help="按项目名过滤")
+    parser.add_argument("--iteration", help="按迭代版本或迭代名称过滤")
+    parser.set_defaults(func=list_records)
+    return parser
+
+
+def build_rename_parser():
+    parser = argparse.ArgumentParser(
+        prog="gc rename",
+        description="重命名 Git 分支并同步 gc 台账记录。",
+    )
+    add_ledger_argument(parser)
+    parser.add_argument("new_branch", help="新的分支名")
+    parser.add_argument("--from", dest="old_branch", help="要重命名的旧分支名，默认当前分支")
+    parser.add_argument("-n", "--name", help="顺便更新迭代名称")
+    parser.add_argument("--dry-run", action="store_true", help="只预览，不执行 Git 重命名")
+    parser.set_defaults(func=rename_branch)
+    return parser
+
+
+def build_web_parser():
+    parser = argparse.ArgumentParser(
+        prog="gc web",
+        description="启动 gc 分支记录可视化页面。",
+    )
+    add_ledger_argument(parser)
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"配置文件路径，默认 {DEFAULT_CONFIG}")
+    parser.add_argument("--host", default=DEFAULT_WEB_HOST, help=f"监听地址，默认 {DEFAULT_WEB_HOST}")
+    parser.add_argument("--port", type=int, default=DEFAULT_WEB_PORT, help=f"起始端口，默认 {DEFAULT_WEB_PORT}")
+    parser.add_argument("--project", help="只渲染指定项目")
+    parser.add_argument("--iteration", help="只渲染指定迭代版本或迭代名称")
+    parser.add_argument("--no-open", action="store_true", help="只启动服务，不自动打开浏览器")
+    parser.set_defaults(func=web_dashboard)
+    return parser
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    try:
+        if argv[:1] == ["list"]:
+            parser = build_list_parser()
+            args = parser.parse_args(argv[1:])
+            return args.func(args)
+
+        if argv[:1] == ["web"]:
+            parser = build_web_parser()
+            args = parser.parse_args(argv[1:])
+            return args.func(args)
+
+        if argv[:1] == ["rename"]:
+            parser = build_rename_parser()
+            args = parser.parse_args(argv[1:])
+            return args.func(args)
+
+        parser = build_create_parser()
+        args = parser.parse_args(argv)
+
+        if not args.name:
+            parser.error("缺少迭代名称，请使用 -n，例如：gc ma-1.6.8-docFetch-5.20 -n 同行账号监控")
+
+        return args.func(args)
+    except (RuntimeError, ValueError) as error:
+        print(f"gc: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
