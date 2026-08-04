@@ -6,6 +6,7 @@ import http.server
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -45,6 +46,22 @@ def run_git(args, cwd=None, check=True):
         message = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(message)
     return result.stdout.strip()
+
+
+def format_git_command(args):
+    return " ".join(shlex.quote(part) for part in ["git", *args])
+
+
+def run_git_passthrough(args, cwd=None):
+    print(f"$ {format_git_command(args)}")
+    try:
+        result = subprocess.run(["git", *args], cwd=cwd)
+    except FileNotFoundError as error:
+        if cwd and not Path(cwd).exists():
+            raise RuntimeError(f"本地项目路径不存在: {cwd}") from error
+        raise RuntimeError(str(error)) from error
+    if result.returncode != 0:
+        raise RuntimeError(f"命令执行失败: {format_git_command(args)}")
 
 
 def default_branch_date():
@@ -588,8 +605,68 @@ def update_record_status(ledger_path, target_id, status):
 def current_git_branch(repo_root):
     branch = run_git(["branch", "--show-current"], cwd=repo_root)
     if not branch:
-        raise RuntimeError("当前处于 detached HEAD，无法判断要重命名的分支")
+        raise RuntimeError("当前处于 detached HEAD，无法判断当前分支")
     return branch
+
+
+def current_upstream_branch(repo_root):
+    return run_git(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        cwd=repo_root,
+        check=False,
+    )
+
+
+def has_staged_changes(repo_root):
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        return False
+    if result.returncode == 1:
+        return True
+    message = result.stderr.decode("utf-8", errors="replace").strip()
+    raise RuntimeError(message or "无法判断暂存区变更")
+
+
+def has_worktree_changes(repo_root):
+    return bool(run_git(["status", "--porcelain"], cwd=repo_root))
+
+
+def push_branch(args):
+    repo_root = run_git(["rev-parse", "--show-toplevel"])
+    branch = current_git_branch(repo_root)
+    upstream = current_upstream_branch(repo_root)
+    push_args = ["push"] if upstream else ["push", "--set-upstream", args.remote, branch]
+
+    if args.dry_run:
+        print("dry-run: 将执行以下操作")
+        print(f"  {format_git_command(['add', '.'])}")
+        if has_worktree_changes(repo_root):
+            print(f"  {format_git_command(['commit', '-m', args.message])}")
+        else:
+            print("  跳过 commit：没有可提交变更")
+        print(f"  {format_git_command(push_args)}")
+        return 0
+
+    print(f"当前分支: {branch}")
+    run_git_passthrough(["add", "."], cwd=repo_root)
+
+    if has_staged_changes(repo_root):
+        run_git_passthrough(["commit", "-m", args.message], cwd=repo_root)
+    else:
+        print("没有可提交变更，跳过 commit")
+
+    if upstream:
+        print(f"远端跟踪分支: {upstream}")
+    else:
+        print(f"当前分支还没有远端跟踪分支，将设置 upstream: {args.remote}/{branch}")
+    run_git_passthrough(push_args, cwd=repo_root)
+    print("推送完成")
+    return 0
 
 
 def update_ledger_branch(ledger_path, repo_root, old_branch, new_branch, iteration_name=None):
@@ -2236,6 +2313,18 @@ def build_rename_parser():
     return parser
 
 
+def build_push_parser(prog="gc push"):
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="执行 git add .、git commit 和 git push，一键提交并推送当前分支。",
+    )
+    parser.add_argument("-m", "--message", required=True, help="提交信息")
+    parser.add_argument("--remote", default="origin", help="远端名称，默认 origin")
+    parser.add_argument("--dry-run", action="store_true", help="只预览，不执行 add、commit 或 push")
+    parser.set_defaults(func=push_branch)
+    return parser
+
+
 def build_web_parser():
     parser = argparse.ArgumentParser(
         prog="gc web",
@@ -2268,6 +2357,11 @@ def main(argv=None):
 
         if argv[:1] == ["rename"]:
             parser = build_rename_parser()
+            args = parser.parse_args(argv[1:])
+            return args.func(args)
+
+        if argv[:1] in (["push"], ["p"]):
+            parser = build_push_parser(prog=f"gc {argv[0]}")
             args = parser.parse_args(argv[1:])
             return args.func(args)
 

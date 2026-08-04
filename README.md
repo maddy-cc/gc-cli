@@ -51,6 +51,18 @@ gc web
 gc list
 ```
 
+提交并推送当前分支：
+
+```bash
+gc push -m "修复数字人形象展示"
+```
+
+快捷写法：
+
+```bash
+gc p -m "修复数字人形象展示"
+```
+
 重命名当前分支，并同步更新本地记录：
 
 ```bash
@@ -344,6 +356,74 @@ remote ref does not exist
 ```
 
 说明远端没有这个旧分支，一般可以忽略。
+
+## 提交并推送分支
+
+`gc push` 用来一键完成当前项目的提交和推送。
+
+基本用法：
+
+```bash
+gc push -m "修复数字人形象展示"
+```
+
+它会依次执行：
+
+```bash
+git add .
+git commit -m "修复数字人形象展示"
+git push
+```
+
+如果当前分支还没有远端跟踪分支，会自动改为：
+
+```bash
+git push --set-upstream origin 当前分支名
+```
+
+例如当前分支是 `ma-1.7.6-profile-8.4`，会执行：
+
+```bash
+git push --set-upstream origin ma-1.7.6-profile-8.4
+```
+
+### 快捷命令
+
+`gc p` 是 `gc push` 的快捷写法：
+
+```bash
+gc p -m "修复数字人形象展示"
+```
+
+### 提交信息
+
+`-m, --message` 是必填项：
+
+```bash
+gc push -m "提交信息"
+```
+
+如果执行 `git add .` 后没有可提交变更，`gc push` 会跳过 `git commit`，但仍会继续执行推送。
+
+### 指定远端
+
+默认远端是 `origin`。
+
+如果需要指定其他远端：
+
+```bash
+gc push -m "提交信息" --remote upstream
+```
+
+`--remote` 只在当前分支还没有远端跟踪分支时使用。
+
+### 只预览
+
+```bash
+gc push -m "提交信息" --dry-run
+```
+
+只打印将要执行的 Git 命令，不会真正执行 `git add`、`git commit` 或 `git push`。
 
 ## GitLab MR
 
