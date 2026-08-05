@@ -669,6 +669,36 @@ def push_branch(args):
     return 0
 
 
+def merge_branch(args):
+    repo_root = run_git(["rev-parse", "--show-toplevel"])
+    branch = current_git_branch(repo_root)
+    upstream = current_upstream_branch(repo_root)
+    push_args = ["push"] if upstream else ["push", "--set-upstream", args.remote, branch]
+    merge_args = ["merge", args.branch]
+
+    if args.dry_run:
+        print("dry-run: 将执行以下操作")
+        print(f"  {format_git_command(merge_args)}")
+        print(f"  {format_git_command(push_args)}")
+        return 0
+
+    print(f"当前分支: {branch}")
+    print(f"合并分支: {args.branch}")
+    print(f"$ {format_git_command(merge_args)}")
+    result = subprocess.run(["git", *merge_args], cwd=repo_root)
+    if result.returncode != 0:
+        print("合并未完成，可能存在冲突。请解决冲突并完成提交后，再执行 gc push -m \"提交信息\" 推送。")
+        return result.returncode
+
+    if upstream:
+        print(f"远端跟踪分支: {upstream}")
+    else:
+        print(f"当前分支还没有远端跟踪分支，将设置 upstream: {args.remote}/{branch}")
+    run_git_passthrough(push_args, cwd=repo_root)
+    print("合并并推送完成")
+    return 0
+
+
 def update_ledger_branch(ledger_path, repo_root, old_branch, new_branch, iteration_name=None):
     records, path = read_records(ledger_path)
     if not records:
@@ -2325,6 +2355,18 @@ def build_push_parser(prog="gc push"):
     return parser
 
 
+def build_merge_parser(prog="gc merge"):
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="执行 git merge 和 git push，合并分支后推送当前分支。",
+    )
+    parser.add_argument("branch", help="要合并到当前分支的分支名")
+    parser.add_argument("--remote", default="origin", help="远端名称，默认 origin")
+    parser.add_argument("--dry-run", action="store_true", help="只预览，不执行 merge 或 push")
+    parser.set_defaults(func=merge_branch)
+    return parser
+
+
 def build_web_parser():
     parser = argparse.ArgumentParser(
         prog="gc web",
@@ -2362,6 +2404,11 @@ def main(argv=None):
 
         if argv[:1] in (["push"], ["p"]):
             parser = build_push_parser(prog=f"gc {argv[0]}")
+            args = parser.parse_args(argv[1:])
+            return args.func(args)
+
+        if argv[:1] in (["merge"], ["m"]):
+            parser = build_merge_parser(prog=f"gc {argv[0]}")
             args = parser.parse_args(argv[1:])
             return args.func(args)
 

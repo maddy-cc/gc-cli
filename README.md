@@ -63,6 +63,12 @@ gc push -m "修复数字人形象展示"
 gc p -m "修复数字人形象展示"
 ```
 
+合并分支并推送当前分支：
+
+```bash
+gc m ma-1.7.6-profile-8.4
+```
+
 重命名当前分支，并同步更新本地记录：
 
 ```bash
@@ -424,6 +430,63 @@ gc push -m "提交信息" --dry-run
 ```
 
 只打印将要执行的 Git 命令，不会真正执行 `git add`、`git commit` 或 `git push`。
+
+## 合并并推送分支
+
+`gc merge` 用来把指定分支合并到当前分支，合并成功后推送当前分支。
+
+基本用法：
+
+```bash
+gc merge ma-1.7.6-profile-8.4
+```
+
+快捷写法：
+
+```bash
+gc m ma-1.7.6-profile-8.4
+```
+
+它会依次执行：
+
+```bash
+git merge ma-1.7.6-profile-8.4
+git push
+```
+
+如果当前分支还没有远端跟踪分支，会自动改为：
+
+```bash
+git push --set-upstream origin 当前分支名
+```
+
+如果 `git merge` 遇到冲突或失败，`gc merge` 会停下来，不会继续执行 `git push`。
+
+解决冲突并完成提交后，可以再执行：
+
+```bash
+gc push -m "解决合并冲突"
+```
+
+### 指定远端
+
+默认远端是 `origin`。
+
+如果需要指定其他远端：
+
+```bash
+gc merge ma-1.7.6-profile-8.4 --remote upstream
+```
+
+`--remote` 只在当前分支还没有远端跟踪分支时使用。
+
+### 只预览
+
+```bash
+gc merge ma-1.7.6-profile-8.4 --dry-run
+```
+
+只打印将要执行的 Git 命令，不会真正执行 `git merge` 或 `git push`。
 
 ## GitLab MR
 
