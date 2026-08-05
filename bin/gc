@@ -1514,7 +1514,7 @@ def render_dashboard(indexed_records, ledger_path):
         <input id="search" type="search" placeholder="搜索分支、迭代名称、功能、项目">
         <select id="project"><option value="">全部项目</option></select>
         <select id="iteration"><option value="">全部迭代</option></select>
-        <select id="statusFilter"><option value="">全部状态</option><option value="未上线">未上线</option><option value="已上线">已上线</option></select>
+        <select id="statusFilter"><option value="">全部状态</option><option value="未上线" selected>未上线</option><option value="已上线">已上线</option></select>
         <button id="reset" type="button">重置</button>
       </div>
     </div>
@@ -2095,7 +2095,7 @@ def render_dashboard(indexed_records, ledger_path):
       search.value = "";
       project.value = "";
       iteration.value = "";
-      statusFilter.value = "";
+      statusFilter.value = STATUS_NOT_LIVE;
       rerenderFromFirstPage();
     }});
   </script>

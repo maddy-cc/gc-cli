@@ -493,6 +493,18 @@ gc merge ma-1.7.6-profile-8.4 --dry-run
 
 只打印将要执行的 Git 命令，不会真正执行 `git merge` 或 `git push`。
 
+## Web 页面
+
+打开本地 Web 页面：
+
+```bash
+gc web
+```
+
+页面顶部的状态筛选默认是 `未上线`。
+
+如果需要查看全部记录，可以把状态筛选切换为 `全部状态`。
+
 ## GitLab MR
 
 打开 Web 页面：
