@@ -450,9 +450,12 @@ gc m ma-1.7.6-profile-8.4
 它会依次执行：
 
 ```bash
-git merge ma-1.7.6-profile-8.4
+git pull --no-edit
+git merge --no-edit ma-1.7.6-profile-8.4
 git push
 ```
+
+`git pull --no-edit` 只会在当前分支已经有远端跟踪分支时执行。
 
 如果当前分支还没有远端跟踪分支，会自动改为：
 
@@ -460,7 +463,9 @@ git push
 git push --set-upstream origin 当前分支名
 ```
 
-如果 `git merge` 遇到冲突或失败，`gc merge` 会停下来，不会继续执行 `git push`。
+`--no-edit` 用来避免 Git 打开编辑器填写 merge commit message。
+
+如果 `git pull` 或 `git merge` 遇到冲突或失败，`gc merge` 会停下来，不会继续执行 `git push`。
 
 解决冲突并完成提交后，可以再执行：
 

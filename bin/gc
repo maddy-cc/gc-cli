@@ -673,16 +673,31 @@ def merge_branch(args):
     repo_root = run_git(["rev-parse", "--show-toplevel"])
     branch = current_git_branch(repo_root)
     upstream = current_upstream_branch(repo_root)
+    pull_args = ["pull", "--no-edit"] if upstream else None
     push_args = ["push"] if upstream else ["push", "--set-upstream", args.remote, branch]
-    merge_args = ["merge", args.branch]
+    merge_args = ["merge", "--no-edit", args.branch]
 
     if args.dry_run:
         print("dry-run: 将执行以下操作")
+        if pull_args:
+            print(f"  {format_git_command(pull_args)}")
+        else:
+            print("  跳过 pull：当前分支还没有远端跟踪分支")
         print(f"  {format_git_command(merge_args)}")
         print(f"  {format_git_command(push_args)}")
         return 0
 
     print(f"当前分支: {branch}")
+    if pull_args:
+        print(f"远端跟踪分支: {upstream}")
+        print(f"$ {format_git_command(pull_args)}")
+        result = subprocess.run(["git", *pull_args], cwd=repo_root)
+        if result.returncode != 0:
+            print("pull 未完成，可能存在冲突或远端更新失败。请处理后再重新执行 gc merge。")
+            return result.returncode
+    else:
+        print("当前分支还没有远端跟踪分支，跳过 pull")
+
     print(f"合并分支: {args.branch}")
     print(f"$ {format_git_command(merge_args)}")
     result = subprocess.run(["git", *merge_args], cwd=repo_root)
