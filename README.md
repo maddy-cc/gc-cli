@@ -378,8 +378,11 @@ gc push -m "修复数字人形象展示"
 ```bash
 git add .
 git commit -m "修复数字人形象展示"
+git pull --rebase --autostash
 git push
 ```
+
+`git pull --rebase --autostash` 只会在当前分支已有远端跟踪分支，而且远端分支确实存在时执行。
 
 如果当前分支还没有远端跟踪分支，会自动改为：
 
@@ -392,6 +395,8 @@ git push --set-upstream origin 当前分支名
 ```bash
 git push --set-upstream origin ma-1.7.6-profile-8.4
 ```
+
+如果远端跟踪分支不存在或无法确认，`gc push` 会直接跳过 `pull`，然后继续 `push`。
 
 ### 快捷命令
 
@@ -430,6 +435,7 @@ gc push -m "提交信息" --dry-run
 ```
 
 只打印将要执行的 Git 命令，不会真正执行 `git add`、`git commit` 或 `git push`。
+`gc push` 在 `dry-run` 下不会探测远端，只会提示有 upstream 时会尝试同步。
 
 ## 合并并推送分支
 
