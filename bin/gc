@@ -780,6 +780,43 @@ def update_ledger_branch(ledger_path, repo_root, old_branch, new_branch, iterati
     return updated, path
 
 
+def update_iteration_name(args):
+    repo = get_repo_context()
+    repo_root = repo["repo_root"]
+    branch = current_git_branch(repo_root)
+    records, ledger_path = read_records(args.ledger)
+    updated = 0
+
+    for record in records:
+        if record.get("branch") != branch:
+            continue
+        if record.get("repo_root"):
+            if record.get("repo_root") != repo_root:
+                continue
+        elif record.get("project") != repo["project_name"]:
+            continue
+        record["iteration_name"] = args.name
+        updated += 1
+
+    if args.dry_run:
+        print("dry-run: 将更新以下台账内容")
+        print(f"  项目: {repo['project_name']}")
+        print(f"  分支: {branch}")
+        print(f"  迭代名称: {args.name}")
+        print(f"  匹配记录: {updated} 条")
+        return 0
+
+    if updated:
+        write_records(records, ledger_path)
+        print(f"已更新迭代名称: {args.name}")
+        print(f"项目: {repo['project_name']}")
+        print(f"分支: {branch}")
+        print(f"已同步台账记录: {updated} 条")
+    else:
+        print(f"未找到当前项目和分支对应的台账记录: {ledger_path}")
+    return 0
+
+
 def rename_branch(args):
     branch_meta = parse_branch_name(args.new_branch)
     repo = get_repo_context()
@@ -2394,6 +2431,18 @@ def build_rename_parser():
     return parser
 
 
+def build_name_parser():
+    parser = argparse.ArgumentParser(
+        prog="gc name",
+        description="只更新当前 Git 分支对应的迭代名称，不修改分支名。",
+    )
+    add_ledger_argument(parser)
+    parser.add_argument("name", help="新的迭代名称")
+    parser.add_argument("--dry-run", action="store_true", help="只预览，不更新本地记录")
+    parser.set_defaults(func=update_iteration_name)
+    return parser
+
+
 def build_push_parser(prog="gc push"):
     parser = argparse.ArgumentParser(
         prog=prog,
@@ -2450,6 +2499,11 @@ def main(argv=None):
 
         if argv[:1] == ["rename"]:
             parser = build_rename_parser()
+            args = parser.parse_args(argv[1:])
+            return args.func(args)
+
+        if argv[:1] == ["name"]:
+            parser = build_name_parser()
             args = parser.parse_args(argv[1:])
             return args.func(args)
 

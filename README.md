@@ -75,6 +75,12 @@ gc m ma-1.7.6-profile-8.4
 gc rename ma-dhSelectOpt-5.22 -n "数字人列表选择优化"
 ```
 
+只修改当前分支的迭代名称：
+
+```bash
+gc name "新的迭代名称"
+```
+
 只预览，不创建分支、不写入记录：
 
 ```bash
@@ -362,6 +368,28 @@ remote ref does not exist
 ```
 
 说明远端没有这个旧分支，一般可以忽略。
+
+## 只修改迭代名称
+
+如果只想修改当前分支的迭代名称、保持 Git 分支名不变，可以使用 `gc name`：
+
+```bash
+gc name "新的迭代名称"
+```
+
+它只会更新当前项目、当前分支对应的本地台账记录，不会执行任何 Git 分支操作。
+
+只预览将要更新的内容：
+
+```bash
+gc name "新的迭代名称" --dry-run
+```
+
+如果需要指定其他台账文件，可以使用 `--ledger`：
+
+```bash
+gc name "新的迭代名称" --ledger /path/to/ledger.jsonl
+```
 
 ## 提交并推送分支
 
